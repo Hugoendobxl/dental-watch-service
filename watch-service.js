@@ -196,7 +196,8 @@ async function importPatients(patients) {
   
   for (const patient of patients) {
     try {
-      await axios.post(`${API_URL}/patients`, {
+      // Créer le patient
+      const res = await axios.post(`${API_URL}/patients`, {
         ...patient,
         statut_envoi: 'en_attente',
         reponse: 'en_attente',
@@ -204,6 +205,15 @@ async function importPatients(patients) {
       }, {
         headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
       });
+      
+      // Récupérer l'ID du patient créé et mettre nouveau=true via PATCH
+      const patientId = res.data?.patient?.id;
+      if (patientId) {
+        await axios.patch(`${API_URL}/patients/${patientId}`, { nouveau: true }, {
+          headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
+        });
+      }
+      
       success++;
     } catch (err) {
       const status = err.response?.status;
