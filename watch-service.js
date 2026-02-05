@@ -1,371 +1,322 @@
-// ═══════════════════════════════════════════════════════════════════════
-// SERVICE DE SURVEILLANCE AUTOMATIQUE - GOOGLE DRIVE → BASE DE DONNÉES
-// Vérifie Google Drive toutes les 5 minutes et importe automatiquement
-// ═══════════════════════════════════════════════════════════════════════
-
-const XLSX = require('xlsx');
-const xlsx = require('node-xlsx');
 const { google } = require('googleapis');
-const fs = require('fs');
 const axios = require('axios');
+const fs = require('fs');
 const path = require('path');
-require('dotenv').config();
 
-// Configuration
-const FOLDER_NAME = 'Rappels_RDV_WhatsApp';
-const CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
-const API_URL = process.env.API_URL || 'http://localhost:5000/api';
-const PROCESSED_FILES_LOG = './processed_files.json';
+// ─── CONFIGURATION ──────────────────────────────────────────────────────
+const API_URL = process.env.API_URL || 'https://backend-rappels-whatsapp-production.up.railway.app/api';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+const FOLDER_NAME = process.env.DRIVE_FOLDER_NAME || 'Rappels_RDV_WhatsApp';
+const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 300000; // 5 minutes
 
-// ─── GARDER LA TRACE DES FICHIERS DÉJÀ TRAITÉS ────────────────────────
-function loadProcessedFiles() {
-  if (fs.existsSync(PROCESSED_FILES_LOG)) {
-    return JSON.parse(fs.readFileSync(PROCESSED_FILES_LOG, 'utf8'));
+// ─── GOOGLE AUTH ────────────────────────────────────────────────────────
+function getAuthClient() {
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  const token = JSON.parse(process.env.GOOGLE_TOKEN);
+  
+  const { client_secret, client_id, redirect_uris } = credentials.installed || credentials.web;
+  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, (redirect_uris && redirect_uris[0]) || '');
+  oAuth2Client.setCredentials(token);
+  
+  return oAuth2Client;
+}
+
+// ─── NETTOYAGE TELEPHONE ────────────────────────────────────────────────
+function cleanPhone(raw) {
+  if (!raw) return null;
+  let phone = String(raw).replace(/[\s.\-\/\(\)]/g, '').trim();
+  
+  if (phone.startsWith('+')) {
+    return phone;
   }
-  return [];
-}
-
-function saveProcessedFile(fileId, fileName) {
-  const processed = loadProcessedFiles();
-  processed.push({ fileId, fileName, processedAt: new Date().toISOString() });
-  fs.writeFileSync(PROCESSED_FILES_LOG, JSON.stringify(processed, null, 2));
-}
-
-function isFileProcessed(fileId) {
-  const processed = loadProcessedFiles();
-  return processed.some(f => f.fileId === fileId);
-}
-
-// ─── AUTHENTIFICATION GOOGLE DRIVE ────────────────────────────────────
-async function authorize() {
-  try {
-    const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-    const { client_secret, client_id, redirect_uris } = credentials.installed || credentials.web;
-    const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-
-    const token = JSON.parse(process.env.GOOGLE_TOKEN);
-    oAuth2Client.setCredentials(token);
-    return oAuth2Client;
-  } catch (error) {
-    console.error('❌ Erreur authentification Google:', error.message);
-    throw error;
+  if (phone.startsWith('00')) {
+    return '+' + phone.substring(2);
   }
-}
-
-// ─── RÉCUPÉRER LES NOUVEAUX FICHIERS EXCEL ────────────────────────────
-async function getNewExcelFiles(auth) {
-  const drive = google.drive({ version: 'v3', auth });
-
-  // 1. Trouver le dossier
-  const folderResponse = await drive.files.list({
-    q: `name='${FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder'`,
-    fields: 'files(id, name)',
-    spaces: 'drive'
-  });
-
-  if (folderResponse.data.files.length === 0) {
-    console.log(`⚠️  Dossier "${FOLDER_NAME}" introuvable`);
-    return [];
+  if (phone.length === 10 && phone.startsWith('0')) {
+    return '+32' + phone.substring(1);
   }
-
-  const folderId = folderResponse.data.files[0].id;
-
-  // 2. Récupérer tous les fichiers Excel non traités
-  const filesResponse = await drive.files.list({
-    q: `'${folderId}' in parents and (name contains '.xls' or name contains '.xlsx')`,
-    orderBy: 'modifiedTime desc',
-    fields: 'files(id, name, modifiedTime)',
-    pageSize: 10
-  });
-
-  // Filtrer les fichiers déjà traités
-  const newFiles = filesResponse.data.files.filter(file => !isFileProcessed(file.id));
-  
-  return { drive, folderId, newFiles };
-}
-
-// ─── TÉLÉCHARGER UN FICHIER ───────────────────────────────────────────
-async function downloadFile(drive, fileId, fileName) {
-  const tempPath = path.join('/tmp', fileName);
-  const dest = fs.createWriteStream(tempPath);
-  
-  const response = await drive.files.get(
-    { fileId: fileId, alt: 'media' },
-    { responseType: 'stream' }
-  );
-
-  return new Promise((resolve, reject) => {
-    response.data
-      .on('end', () => resolve(tempPath))
-      .on('error', reject)
-      .pipe(dest);
-  });
-}
-
-// ─── CONVERTIR XLS EN XLSX ────────────────────────────────────────────
-async function convertXlsToXlsx(xlsPath) {
-  const xlsxPath = xlsPath.replace('.xls', '.xlsx');
-  
-  return new Promise((resolve, reject) => {
-    const { exec } = require('child_process');
-    const pythonScript = `
-import sys
-import pandas as pd
-try:
-    df = pd.read_excel('${xlsPath}', engine='xlrd', header=None)
-    df.to_excel('${xlsxPath}', index=False, header=False, engine='openpyxl')
-    print('OK')
-except Exception as e:
-    print(f'ERROR: {e}')
-    sys.exit(1)
-`;
-    
-    exec(`python3 -c "${pythonScript.replace(/\n/g, ';')}"`, (error, stdout, stderr) => {
-      if (error || stdout.includes('ERROR')) {
-        reject(new Error('Conversion échouée'));
-      } else {
-        resolve(xlsxPath);
-      }
-    });
-  });
-}
-
-// ─── NETTOYER LE NUMÉRO DE TÉLÉPHONE ───────────────────────────────────
-function cleanPhoneNumber(phone) {
-  if (!phone) return null;
-  let cleaned = String(phone).replace(/[\s.\-/]/g, '');
-  
-  if (cleaned.startsWith('00')) {
-    cleaned = '+' + cleaned.substring(2);
-  } else if (cleaned.startsWith('+')) {
-    // OK
-  } else if (cleaned.startsWith('0') && cleaned.length === 10) {
-    cleaned = '+32' + cleaned.substring(1);
-  } else if (!cleaned.startsWith('0') && cleaned.length === 9) {
-    cleaned = '+32' + cleaned;
-  } else if (!cleaned.startsWith('+')) {
-    cleaned = '+' + cleaned;
+  if (phone.length === 9 && !phone.startsWith('0')) {
+    return '+32' + phone;
   }
-  
-  return cleaned;
+  return '+' + phone;
 }
 
-// ─── NETTOYER L'HEURE ──────────────────────────────────────────────────
-function cleanTime(time) {
-  if (!time) return null;
+// ─── NETTOYAGE HEURE ───────────────────────────────────────────────────
+function cleanTime(raw) {
+  if (!raw) return '';
+  const str = String(raw).trim();
   
-  if (typeof time === 'number') {
-    const hours = Math.floor(time * 24);
-    const minutes = Math.round((time * 24 - hours) * 60);
-    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
-  }
-  
-  const str = String(time);
-  const match = str.match(/(\d{1,2}):(\d{2})/);
+  // Format HH:MM:SS → HH:MM
+  const match = str.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
   if (match) {
     return `${match[1].padStart(2, '0')}:${match[2]}`;
   }
   
-  return null;
+  // Format décimal Excel (ex: 0.354166... = 08:30)
+  const num = parseFloat(str);
+  if (!isNaN(num) && num >= 0 && num < 1) {
+    const totalMinutes = Math.round(num * 24 * 60);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+  }
+  
+  return str;
 }
 
-// ─── PARSER LE FICHIER EXCEL ──────────────────────────────────────────
-async function parseExcelFile(filePath) {
+// ─── NETTOYAGE DATE ────────────────────────────────────────────────────
+function cleanDate(raw) {
+  if (!raw) return null;
+  const str = String(raw).trim();
+  
+  // Format DD-MM-YYYY ou DD/MM/YYYY
+  const match = str.match(/(\d{1,2})[\-\/](\d{1,2})[\-\/](\d{4})/);
+  if (match) {
+    return `${match[3]}-${match[2].padStart(2, '0')}-${match[1].padStart(2, '0')}`;
+  }
+  
+  // Format YYYY-MM-DD (déjà bon)
+  const match2 = str.match(/(\d{4})[\-\/](\d{1,2})[\-\/](\d{1,2})/);
+  if (match2) {
+    return `${match2[1]}-${match2[2].padStart(2, '0')}-${match2[3].padStart(2, '0')}`;
+  }
+  
+  // Excel serial date number
+  const num = parseFloat(str);
+  if (!isNaN(num) && num > 40000 && num < 60000) {
+    const date = new Date((num - 25569) * 86400 * 1000);
+    return date.toISOString().split('T')[0];
+  }
+  
+  return str;
+}
+
+// ─── PARSE EXCEL AVEC XLSX (NODE.JS PUR) ────────────────────────────────
+function parseExcelBuffer(buffer, fileName) {
+  // Essayer plusieurs méthodes de lecture
+  const XLSX = require('xlsx');
+  
+  let workbook;
+  
+  // Méthode 1: Lire comme buffer avec type 'buffer'
   try {
-    let fileToRead = filePath;
-    if (filePath.endsWith('.xls') && !filePath.endsWith('.xlsx')) {
-      console.log('🔄 Conversion .xls → .xlsx...');
-      fileToRead = await convertXlsToXlsx(filePath);
-    }
-    
-    const workSheetsFromFile = xlsx.parse(fileToRead);
-    const sheet = workSheetsFromFile[0];
-    const data = sheet.data;
-    
-    const patients = [];
-    
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      if (!row[3] || !row[4] || !row[9]) continue;
-      
-      const dateRdv = row[0];
-      const prenom = row[3];
-      const nom = row[4];
-      const heureRaw = row[5];
-      const telephone = row[9];
-      
-      const telephoneClean = cleanPhoneNumber(telephone);
-      const heureClean = cleanTime(heureRaw);
-      
-      let dateFormatted;
-      if (typeof dateRdv === 'number') {
-        const excelDate = new Date((dateRdv - 25569) * 86400 * 1000);
-        dateFormatted = excelDate.toISOString().split('T')[0];
-      } else if (typeof dateRdv === 'string') {
-        const parts = dateRdv.split('-');
-        if (parts.length === 3) {
-          dateFormatted = `${parts[2]}-${parts[1]}-${parts[0]}`;
-        } else {
-          dateFormatted = dateRdv;
+    workbook = XLSX.read(buffer, { type: 'buffer' });
+    console.log('   ✅ Lecture avec type buffer réussie');
+  } catch (e1) {
+    console.log('   ⚠️ Échec type buffer, essai avec array...');
+    try {
+      // Méthode 2: Convertir en Uint8Array
+      const uint8 = new Uint8Array(buffer);
+      workbook = XLSX.read(uint8, { type: 'array' });
+      console.log('   ✅ Lecture avec type array réussie');
+    } catch (e2) {
+      console.log('   ⚠️ Échec type array, essai avec base64...');
+      try {
+        // Méthode 3: Convertir en base64
+        const base64 = buffer.toString('base64');
+        workbook = XLSX.read(base64, { type: 'base64' });
+        console.log('   ✅ Lecture avec type base64 réussie');
+      } catch (e3) {
+        console.log('   ⚠️ Échec type base64, essai en écrivant sur disque...');
+        // Méthode 4: Écrire sur disque et relire
+        const tmpPath = '/tmp/temp_import' + path.extname(fileName);
+        fs.writeFileSync(tmpPath, buffer);
+        try {
+          workbook = XLSX.readFile(tmpPath);
+          console.log('   ✅ Lecture via fichier disque réussie');
+        } catch (e4) {
+          // Méthode 5: Forcer le type
+          try {
+            workbook = XLSX.readFile(tmpPath, { type: 'binary' });
+            console.log('   ✅ Lecture via fichier binaire réussie');
+          } catch (e5) {
+            console.error('   ❌ Toutes les méthodes ont échoué');
+            console.error('   Erreur finale:', e5.message);
+            
+            // Méthode 6: Lire le binaire manuellement
+            try {
+              const binary = fs.readFileSync(tmpPath, 'binary');
+              workbook = XLSX.read(binary, { type: 'binary' });
+              console.log('   ✅ Lecture binaire manuelle réussie');
+            } catch (e6) {
+              throw new Error('Impossible de lire le fichier Excel: ' + e6.message);
+            }
+          }
+        } finally {
+          try { fs.unlinkSync(tmpPath); } catch(e) {}
         }
       }
-      
-      if (!telephoneClean || !heureClean || !dateFormatted) continue;
-      
-      patients.push({
-        nom,
-        prenom,
-        telephone: telephoneClean,
-        date_rdv: dateFormatted,
-        heure_rdv: heureClean,
-        statut_envoi: 'en_attente',
-        reponse: 'en_attente',
-        traite: false,
-        nouveau: true // MARQUER COMME NOUVEAU
-      });
+    }
+  }
+  
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+  
+  console.log(`   📊 ${rows.length} lignes trouvées (dont 1 en-tête)`);
+  
+  if (rows.length < 2) {
+    throw new Error('Fichier vide ou sans données');
+  }
+  
+  // Colonnes: A=Jour, B=Stoel, C=N°fiche, D=Prénom, E=Nom, F=Début, G=Durée, H=Sujet, I=N°modèle, J=GSM, K=Email
+  const patients = [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || row.length < 6) continue;
+    
+    const dateRaw = row[0];
+    const prenom = String(row[3] || '').trim();
+    const nom = String(row[4] || '').trim();
+    const heureRaw = row[5];
+    const gsmRaw = row[9];
+    
+    if (!prenom && !nom) continue;
+    
+    const date = cleanDate(dateRaw);
+    const heure = cleanTime(heureRaw);
+    const telephone = cleanPhone(gsmRaw);
+    
+    if (!telephone) {
+      console.log(`   ⚠️ Pas de téléphone pour ${prenom} ${nom}, ignoré`);
+      continue;
     }
     
-    return patients;
-  } catch (error) {
-    console.error('❌ Erreur parsing:', error.message);
-    throw error;
+    patients.push({ nom, prenom, telephone, date_rdv: date, heure_rdv: heure });
+    console.log(`   ✅ ${prenom} ${nom} - ${telephone} - ${date} ${heure}`);
   }
+  
+  return patients;
 }
 
-// ─── IMPORTER DANS LA BASE DE DONNÉES ─────────────────────────────────
-async function importToDatabase(patients) {
-  const token = process.env.ADMIN_TOKEN;
-  let imported = 0;
-  let skipped = 0;
+// ─── IMPORT PATIENTS DANS LA BASE ──────────────────────────────────────
+async function importPatients(patients) {
+  let success = 0;
+  let errors = 0;
   
   for (const patient of patients) {
     try {
-      await axios.post(
-        `${API_URL}/patients`,
-        patient,
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
-      imported++;
-    } catch (error) {
-      if (error.response?.status === 409) {
-        skipped++;
-      } else {
-        console.error(`❌ Erreur import ${patient.prenom} ${patient.nom}:`, error.message);
-      }
+      await axios.post(`${API_URL}/patients`, {
+        ...patient,
+        statut_envoi: 'en_attente',
+        reponse: 'en_attente',
+        nouveau: true
+      }, {
+        headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
+      });
+      success++;
+    } catch (err) {
+      const status = err.response?.status;
+      const msg = err.response?.data?.error || err.message;
+      console.error(`   ❌ Erreur import ${patient.prenom} ${patient.nom}: ${status} - ${msg}`);
+      errors++;
     }
   }
   
-  return { imported, skipped };
+  return { success, errors };
 }
 
-// ─── SUPPRIMER LE FICHIER DE GOOGLE DRIVE ─────────────────────────────
-async function deleteFileFromDrive(drive, fileId) {
+// ─── SURVEILLANCE GOOGLE DRIVE ─────────────────────────────────────────
+async function checkGoogleDrive() {
   try {
-    await drive.files.delete({ fileId });
-    console.log('✓ Fichier supprimé de Google Drive (RGPD)');
-  } catch (error) {
-    console.error('⚠️  Impossible de supprimer le fichier:', error.message);
-  }
-}
-
-// ─── TRAITER UN FICHIER ───────────────────────────────────────────────
-async function processFile(drive, file) {
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`📄 Traitement: ${file.name}`);
-  console.log(`${'='.repeat(60)}`);
-  
-  try {
-    // 1. Télécharger
-    console.log('📥 Téléchargement...');
-    const filePath = await downloadFile(drive, file.id, file.name);
+    const auth = getAuthClient();
+    const drive = google.drive({ version: 'v3', auth });
     
-    // 2. Parser
-    console.log('📊 Lecture des données...');
-    const patients = await parseExcelFile(filePath);
-    console.log(`✓ ${patients.length} patients trouvés`);
+    // Trouver le dossier
+    const folderRes = await drive.files.list({
+      q: `name='${FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      fields: 'files(id, name)',
+    });
     
-    if (patients.length === 0) {
-      console.log('⚠️  Aucun patient à importer');
+    if (!folderRes.data.files || folderRes.data.files.length === 0) {
+      console.log(`   📁 Dossier "${FOLDER_NAME}" non trouvé`);
       return;
     }
     
-    // 3. Importer
-    console.log('💾 Import dans la base de données...');
-    const { imported, skipped } = await importToDatabase(patients);
-    console.log(`✓ ${imported} patients importés, ${skipped} déjà existants`);
+    const folderId = folderRes.data.files[0].id;
     
-    // 4. Marquer comme traité
-    saveProcessedFile(file.id, file.name);
+    // Chercher les fichiers Excel dans le dossier
+    const filesRes = await drive.files.list({
+      q: `'${folderId}' in parents and trashed=false and (mimeType='application/vnd.ms-excel' or mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or name contains '.xls')`,
+      fields: 'files(id, name, createdTime, mimeType)',
+      orderBy: 'createdTime desc',
+    });
     
-    // 5. Supprimer de Google Drive
-    console.log('🗑️  Suppression du fichier (RGPD)...');
-    await deleteFileFromDrive(drive, file.id);
+    const files = filesRes.data.files || [];
     
-    // 6. Nettoyer les fichiers temporaires
-    try {
-      fs.unlinkSync(filePath);
-      if (filePath.endsWith('.xls')) {
-        fs.unlinkSync(filePath.replace('.xls', '.xlsx'));
+    if (files.length === 0) {
+      console.log(`   📭 Aucun fichier Excel dans le dossier`);
+      return;
+    }
+    
+    console.log(`   📄 ${files.length} fichier(s) trouvé(s)`);
+    
+    // Traiter chaque fichier
+    for (const file of files) {
+      console.log('');
+      console.log('   ════════════════════════════════════════════════════');
+      console.log(`   📄 Traitement: ${file.name}`);
+      console.log('   ════════════════════════════════════════════════════');
+      
+      try {
+        // Télécharger le fichier
+        console.log('   📦 Téléchargement...');
+        const response = await drive.files.get(
+          { fileId: file.id, alt: 'media' },
+          { responseType: 'arraybuffer' }
+        );
+        
+        const buffer = Buffer.from(response.data);
+        console.log(`   📦 Taille: ${buffer.length} octets`);
+        
+        // Parser le fichier Excel
+        console.log('   📊 Lecture des données...');
+        const patients = parseExcelBuffer(buffer, file.name);
+        
+        if (patients.length === 0) {
+          console.log('   ⚠️ Aucun patient trouvé dans le fichier');
+        } else {
+          // Importer les patients
+          console.log(`   📤 Import de ${patients.length} patient(s)...`);
+          const result = await importPatients(patients);
+          console.log(`   ✅ ${result.success} importé(s), ${result.errors} erreur(s)`);
+        }
+        
+        // Supprimer le fichier du Drive (RGPD)
+        console.log('   🗑️ Suppression du fichier (RGPD)...');
+        await drive.files.delete({ fileId: file.id });
+        console.log('   ✅ Fichier supprimé du Drive');
+        
+      } catch (err) {
+        console.error(`   ❌ ERREUR: ${err.message}`);
       }
-    } catch (e) {}
+    }
     
-    console.log('✅ Traitement terminé avec succès\n');
-    
-  } catch (error) {
-    console.error('❌ ERREUR:', error.message);
+  } catch (err) {
+    console.error(`   ❌ Erreur surveillance: ${err.message}`);
   }
 }
 
-// ─── BOUCLE DE SURVEILLANCE ───────────────────────────────────────────
-async function watchDrive() {
-  console.log('👁️  Surveillance de Google Drive démarrée...');
-  console.log(`📁 Dossier: ${FOLDER_NAME}`);
-  console.log(`⏰ Vérification toutes les ${CHECK_INTERVAL / 60000} minutes\n`);
-  
-  const check = async () => {
-    try {
-      const auth = await authorize();
-      const { drive, newFiles } = await getNewExcelFiles(auth);
-      
-      if (newFiles.length === 0) {
-        console.log(`[${new Date().toLocaleTimeString()}] ✓ Aucun nouveau fichier`);
-        return;
-      }
-      
-      console.log(`[${new Date().toLocaleTimeString()}] 🆕 ${newFiles.length} nouveau(x) fichier(s) détecté(s) !`);
-      
-      for (const file of newFiles) {
-        await processFile(drive, file);
-      }
-      
-    } catch (error) {
-      console.error('❌ Erreur surveillance:', error.message);
-    }
-  };
-  
-  // Première vérification immédiate
-  await check();
-  
-  // Puis toutes les 5 minutes
-  setInterval(check, CHECK_INTERVAL);
-}
+// ─── DÉMARRAGE ─────────────────────────────────────────────────────────
+console.log('');
+console.log('═══════════════════════════════════════════════════════════');
+console.log('       SERVICE DE SURVEILLANCE AUTOMATIQUE');
+console.log('       Google Drive → Base de données');
+console.log('═══════════════════════════════════════════════════════════');
+console.log('');
+console.log(`👀 Surveillance de Google Drive démarrée...`);
+console.log(`📁 Dossier: ${FOLDER_NAME}`);
+console.log(`⏰ Vérification toutes les ${CHECK_INTERVAL / 1000 / 60} minutes`);
+console.log('');
 
-// ─── DÉMARRAGE ────────────────────────────────────────────────────────
-if (require.main === module) {
-  console.log('═══════════════════════════════════════════════════════════');
-  console.log('     SERVICE DE SURVEILLANCE AUTOMATIQUE');
-  console.log('     Google Drive → Base de données');
-  console.log('═══════════════════════════════════════════════════════════\n');
-  
-  watchDrive().catch(error => {
-    console.error('❌ ERREUR FATALE:', error);
-    process.exit(1);
-  });
-}
+// Première vérification immédiate
+checkGoogleDrive();
 
-module.exports = { watchDrive };
+// Puis vérification périodique
+setInterval(checkGoogleDrive, CHECK_INTERVAL);
+
+// Garder le processus en vie
+process.on('SIGTERM', () => {
+  console.log('🛑 Arrêt du service de surveillance');
+  process.exit(0);
+});
