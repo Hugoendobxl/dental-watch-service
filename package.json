@@ -1,0 +1,23 @@
+{
+  "name": "dental-watch-service",
+  "version": "1.0.0",
+  "description": "Service de surveillance automatique Google Drive pour import des patients",
+  "main": "watch-service.js",
+  "scripts": {
+    "start": "node watch-service.js",
+    "dev": "nodemon watch-service.js"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5",
+    "node-xlsx": "^0.23.0",
+    "googleapis": "^128.0.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
