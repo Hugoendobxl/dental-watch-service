@@ -93,47 +93,37 @@ function cleanDate(raw) {
 
 // ─── PARSE EXCEL AVEC XLSX (NODE.JS PUR) ────────────────────────────────
 function parseExcelBuffer(buffer, fileName) {
-  // Essayer plusieurs méthodes de lecture
   const XLSX = require('xlsx');
   
   let workbook;
   
-  // Méthode 1: Lire comme buffer avec type 'buffer'
   try {
     workbook = XLSX.read(buffer, { type: 'buffer' });
     console.log('   ✅ Lecture avec type buffer réussie');
   } catch (e1) {
     console.log('   ⚠️ Échec type buffer, essai avec array...');
     try {
-      // Méthode 2: Convertir en Uint8Array
       const uint8 = new Uint8Array(buffer);
       workbook = XLSX.read(uint8, { type: 'array' });
       console.log('   ✅ Lecture avec type array réussie');
     } catch (e2) {
       console.log('   ⚠️ Échec type array, essai avec base64...');
       try {
-        // Méthode 3: Convertir en base64
         const base64 = buffer.toString('base64');
         workbook = XLSX.read(base64, { type: 'base64' });
         console.log('   ✅ Lecture avec type base64 réussie');
       } catch (e3) {
         console.log('   ⚠️ Échec type base64, essai en écrivant sur disque...');
-        // Méthode 4: Écrire sur disque et relire
         const tmpPath = '/tmp/temp_import' + path.extname(fileName);
         fs.writeFileSync(tmpPath, buffer);
         try {
           workbook = XLSX.readFile(tmpPath);
           console.log('   ✅ Lecture via fichier disque réussie');
         } catch (e4) {
-          // Méthode 5: Forcer le type
           try {
             workbook = XLSX.readFile(tmpPath, { type: 'binary' });
             console.log('   ✅ Lecture via fichier binaire réussie');
           } catch (e5) {
-            console.error('   ❌ Toutes les méthodes ont échoué');
-            console.error('   Erreur finale:', e5.message);
-            
-            // Méthode 6: Lire le binaire manuellement
             try {
               const binary = fs.readFileSync(tmpPath, 'binary');
               workbook = XLSX.read(binary, { type: 'binary' });
@@ -159,7 +149,6 @@ function parseExcelBuffer(buffer, fileName) {
     throw new Error('Fichier vide ou sans données');
   }
   
-  // Colonnes: A=Jour, B=Stoel, C=N°fiche, D=Prénom, E=Nom, F=Début, G=Durée, H=Sujet, I=N°modèle, J=GSM, K=Email
   const patients = [];
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
@@ -189,13 +178,58 @@ function parseExcelBuffer(buffer, fileName) {
   return patients;
 }
 
-// ─── IMPORT PATIENTS DANS LA BASE ──────────────────────────────────────
+// ─── VÉRIFIER SI PATIENT EXISTE DÉJÀ ───────────────────────────────────
+async function patientExists(patient, existingPatients) {
+  // Normaliser l'heure pour comparaison (enlever les secondes si présentes)
+  const normalizeHeure = (h) => {
+    if (!h) return '';
+    const match = h.match(/(\d{2}):(\d{2})/);
+    return match ? `${match[1]}:${match[2]}` : h;
+  };
+  
+  const patientHeure = normalizeHeure(patient.heure_rdv);
+  
+  return existingPatients.some(p => 
+    p.nom.toLowerCase() === patient.nom.toLowerCase() &&
+    p.prenom.toLowerCase() === patient.prenom.toLowerCase() &&
+    p.date_rdv === patient.date_rdv &&
+    normalizeHeure(p.heure_rdv) === patientHeure
+  );
+}
+
+// ─── RÉCUPÉRER TOUS LES PATIENTS EXISTANTS ─────────────────────────────
+async function getExistingPatients() {
+  try {
+    const response = await axios.get(`${API_URL}/patients`, {
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
+    });
+    return response.data || [];
+  } catch (err) {
+    console.error('   ⚠️ Erreur récupération patients existants:', err.message);
+    return [];
+  }
+}
+
+// ─── IMPORT PATIENTS DANS LA BASE (AVEC ANTI-DOUBLON) ──────────────────
 async function importPatients(patients) {
   let success = 0;
+  let skipped = 0;
   let errors = 0;
+  
+  // Récupérer les patients existants pour vérifier les doublons
+  console.log('   🔍 Vérification des doublons...');
+  const existingPatients = await getExistingPatients();
+  console.log(`   📋 ${existingPatients.length} patients déjà en base`);
   
   for (const patient of patients) {
     try {
+      // Vérifier si le patient existe déjà (même nom + date + heure)
+      if (await patientExists(patient, existingPatients)) {
+        console.log(`   ⏭️ Doublon ignoré: ${patient.prenom} ${patient.nom} (${patient.date_rdv} ${patient.heure_rdv})`);
+        skipped++;
+        continue;
+      }
+      
       // Créer le patient
       const res = await axios.post(`${API_URL}/patients`, {
         ...patient,
@@ -212,6 +246,14 @@ async function importPatients(patients) {
         await axios.patch(`${API_URL}/patients/${patientId}`, { nouveau: true }, {
           headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
         });
+        
+        // Ajouter à la liste des patients existants pour éviter les doublons dans le même fichier
+        existingPatients.push({
+          nom: patient.nom,
+          prenom: patient.prenom,
+          date_rdv: patient.date_rdv,
+          heure_rdv: patient.heure_rdv
+        });
       }
       
       success++;
@@ -223,7 +265,7 @@ async function importPatients(patients) {
     }
   }
   
-  return { success, errors };
+  return { success, skipped, errors };
 }
 
 // ─── SURVEILLANCE GOOGLE DRIVE ─────────────────────────────────────────
@@ -232,7 +274,6 @@ async function checkGoogleDrive() {
     const auth = getAuthClient();
     const drive = google.drive({ version: 'v3', auth });
     
-    // Trouver le dossier
     const folderRes = await drive.files.list({
       q: `name='${FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
       fields: 'files(id, name)',
@@ -245,7 +286,6 @@ async function checkGoogleDrive() {
     
     const folderId = folderRes.data.files[0].id;
     
-    // Chercher les fichiers Excel dans le dossier
     const filesRes = await drive.files.list({
       q: `'${folderId}' in parents and trashed=false and (mimeType='application/vnd.ms-excel' or mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or name contains '.xls')`,
       fields: 'files(id, name, createdTime, mimeType)',
@@ -261,7 +301,6 @@ async function checkGoogleDrive() {
     
     console.log(`   📄 ${files.length} fichier(s) trouvé(s)`);
     
-    // Traiter chaque fichier
     for (const file of files) {
       console.log('');
       console.log('   ════════════════════════════════════════════════════');
@@ -269,7 +308,6 @@ async function checkGoogleDrive() {
       console.log('   ════════════════════════════════════════════════════');
       
       try {
-        // Télécharger le fichier
         console.log('   📦 Téléchargement...');
         const response = await drive.files.get(
           { fileId: file.id, alt: 'media' },
@@ -279,20 +317,17 @@ async function checkGoogleDrive() {
         const buffer = Buffer.from(response.data);
         console.log(`   📦 Taille: ${buffer.length} octets`);
         
-        // Parser le fichier Excel
         console.log('   📊 Lecture des données...');
         const patients = parseExcelBuffer(buffer, file.name);
         
         if (patients.length === 0) {
           console.log('   ⚠️ Aucun patient trouvé dans le fichier');
         } else {
-          // Importer les patients
           console.log(`   📤 Import de ${patients.length} patient(s)...`);
           const result = await importPatients(patients);
-          console.log(`   ✅ ${result.success} importé(s), ${result.errors} erreur(s)`);
+          console.log(`   ✅ ${result.success} importé(s), ${result.skipped} doublon(s) ignoré(s), ${result.errors} erreur(s)`);
         }
         
-        // Supprimer le fichier du Drive (RGPD)
         console.log('   🗑️ Suppression du fichier (RGPD)...');
         await drive.files.delete({ fileId: file.id });
         console.log('   ✅ Fichier supprimé du Drive');
@@ -312,6 +347,7 @@ console.log('');
 console.log('═══════════════════════════════════════════════════════════');
 console.log('       SERVICE DE SURVEILLANCE AUTOMATIQUE');
 console.log('       Google Drive → Base de données');
+console.log('       (avec détection anti-doublon)');
 console.log('═══════════════════════════════════════════════════════════');
 console.log('');
 console.log(`👀 Surveillance de Google Drive démarrée...`);
@@ -319,13 +355,9 @@ console.log(`📁 Dossier: ${FOLDER_NAME}`);
 console.log(`⏰ Vérification toutes les ${CHECK_INTERVAL / 1000 / 60} minutes`);
 console.log('');
 
-// Première vérification immédiate
 checkGoogleDrive();
-
-// Puis vérification périodique
 setInterval(checkGoogleDrive, CHECK_INTERVAL);
 
-// Garder le processus en vie
 process.on('SIGTERM', () => {
   console.log('🛑 Arrêt du service de surveillance');
   process.exit(0);
