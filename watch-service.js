@@ -203,7 +203,7 @@ async function getExistingPatients() {
     const response = await axios.get(`${API_URL}/patients`, {
       headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
     });
-    return response.data || [];
+    return response.data.patients || response.data || [];
   } catch (err) {
     console.error('   ⚠️ Erreur récupération patients existants:', err.message);
     return [];
