@@ -373,7 +373,7 @@ async function nettoyageRGPD() {
       const dateRdv = new Date(patient.date_rdv);
       const diffJours = (maintenant - dateRdv) / (1000 * 60 * 60 * 24);
       
-      if (diffJours >= 3) {
+      if (diffJours >= 3 && patient.traite === true) {
         try {
           await axios.delete(`${API_URL}/patients/${patient.id}`, {
             headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
