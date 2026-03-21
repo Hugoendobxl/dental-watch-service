@@ -354,9 +354,54 @@ console.log(`👀 Surveillance de Google Drive démarrée...`);
 console.log(`📁 Dossier: ${FOLDER_NAME}`);
 console.log(`⏰ Vérification toutes les ${CHECK_INTERVAL / 1000 / 60} minutes`);
 console.log('');
-
+// ─── NETTOYAGE RGPD (suppression après 3 jours) ────────────────────────
+async function nettoyageRGPD() {
+  try {
+    console.log('🧹 Nettoyage RGPD en cours...');
+    
+    const response = await axios.get(`${API_URL}/patients`, {
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
+    });
+    
+    const patients = response.data.patients || [];
+    const maintenant = new Date();
+    let supprimes = 0;
+    
+    for (const patient of patients) {
+      if (!patient.traite) continue;
+      
+      const dateRdv = new Date(patient.date_rdv);
+      const diffJours = (maintenant - dateRdv) / (1000 * 60 * 60 * 24);
+      
+      if (diffJours >= 3) {
+        try {
+          await axios.delete(`${API_URL}/patients/${patient.id}`, {
+            headers: { Authorization: `Bearer ${ADMIN_TOKEN}` }
+          });
+          console.log(`   🗑️ Supprimé: ${patient.prenom} ${patient.nom} (RDV: ${patient.date_rdv})`);
+          supprimes++;
+        } catch (err) {
+          console.error(`   ❌ Erreur suppression ${patient.id}: ${err.message}`);
+        }
+      }
+    }
+    
+    if (supprimes === 0) {
+      console.log('   ✅ Aucun patient à supprimer');
+    } else {
+      console.log(`   ✅ ${supprimes} patient(s) supprimé(s) définitivement (RGPD)`);
+    }
+    
+  } catch (err) {
+    console.error('   ❌ Erreur nettoyage RGPD:', err.message);
+  }
+}
 checkGoogleDrive();
 setInterval(checkGoogleDrive, CHECK_INTERVAL);
+
+// Nettoyage RGPD toutes les heures
+nettoyageRGPD();
+setInterval(nettoyageRGPD, 60 * 60 * 1000);
 
 process.on('SIGTERM', () => {
   console.log('🛑 Arrêt du service de surveillance');
